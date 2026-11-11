@@ -1896,7 +1896,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 									state.credentialQuotaPropagated = true
 								}
 							}
-						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
+						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 529:
 							state.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, result.RetryAfter, disableCooling)
 							state.Unavailable = !state.NextRetryAfter.IsZero()
 						default:
@@ -4023,7 +4023,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			}
 			auth.Quota.NextRecoverAt = next
 			auth.NextRetryAfter = next
-		case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
+		case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 529:
 			auth.StatusMessage = "transient upstream error"
 			auth.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, retryAfter, disableCooling)
 			auth.Unavailable = !auth.NextRetryAfter.IsZero()

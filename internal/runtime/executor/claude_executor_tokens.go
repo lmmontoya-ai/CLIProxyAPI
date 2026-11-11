@@ -328,7 +328,7 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, classifyClaudeUpstreamErrorWithCooling(resp.StatusCode, resp.Header, b, e.modelLevelCooling())
+		return cliproxyexecutor.Response{}, e.classifyUpstreamError(ctx, auth, httpReq, resp, b, upstreamModel, false)
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, claudeResponseContentEncoding(resp.Header))
 	if err != nil {

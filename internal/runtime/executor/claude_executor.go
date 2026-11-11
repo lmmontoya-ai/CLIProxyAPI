@@ -31,6 +31,7 @@ type ClaudeExecutor struct {
 	requestLogProvider      string
 	upstreamModelNormalizer func(string) string
 	oauthProfileFetcher     claudeOAuthProfileFetcher
+	oauthUsageVerifier      *helps.ClaudeUsageVerifier
 	// oauthToolAliases is shared by every ForAPIKey copy of this executor;
 	// constructors allocate it so copies made per request reuse one store.
 	oauthToolAliases *claudeOAuthToolAliasStore
@@ -342,7 +343,109 @@ func stripTranslatedDefaultMaxTokens(from sdktranslator.Format, originalPayload,
 }
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor {
-	return &ClaudeExecutor{cfg: cfg, oauthToolAliases: &claudeOAuthToolAliasStore{}}
+	return &ClaudeExecutor{cfg: cfg, oauthToolAliases: &claudeOAuthToolAliasStore{}, oauthUsageVerifier: &helps.ClaudeUsageVerifier{}}
+}
+
+// claudeLongCooldownThreshold is the cooldown above which a 429 is checked
+// against live subscription usage before it is applied.
+const claudeLongCooldownThreshold = 5 * time.Minute
+
+// classifyUpstreamError classifies a non-2xx Claude response. A 429 that would
+// cool the credential for a long time is first checked against the account's
+// live usage, so a narrow or temporary rejection cannot lock out an account
+// that still has room.
+func (e *ClaudeExecutor) classifyUpstreamError(ctx context.Context, auth *cliproxyauth.Auth, request *http.Request, response *http.Response, body []byte, model string, fastRequest bool) error {
+	status := response.StatusCode
+	if status == http.StatusTooManyRequests || status == 529 {
+		helps.LogClaudeRateLimitHeaders(ctx, status, response.Header, model)
+	}
+	var classified error
+	if fastRequest {
+		classified = newClaudeFastDirectResponseError(response, body)
+	} else {
+		classified = classifyClaudeUpstreamErrorWithCooling(status, response.Header, body, e.modelLevelCooling())
+	}
+	if status != http.StatusTooManyRequests || claudeBodyIndicatesFastModeCredits(body) || !claudeErrorCoolsLong(classified) {
+		return classified
+	}
+	if request == nil || !isAnthropicUpstreamURL(request.URL) || auth == nil {
+		return classified
+	}
+	accessToken, _ := claudeCreds(auth)
+	if !helps.IsClaudeOAuthAccessToken(accessToken) {
+		return classified
+	}
+	verdict := e.oauthUsageVerifier.Verdict(ctx, helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0), accessToken, request.Header.Get("User-Agent"), model)
+	logEntry := helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth": auth.ID, "model": model, "usage_verdict": verdict.String()})
+	switch verdict {
+	case helps.ClaudeUsageAvailable:
+		retry := e.oauthUsageVerifier.ContradictionRetryAfter(auth.ID, model)
+		logEntry.WithField("model_cooldown", retry.String()).Warn("Claude 429 contradicts live usage; cooling only this model briefly")
+		if fast, ok := classified.(*claudeFastDirectResponseError); ok {
+			fast.credentialScoped = false
+			fast.retryAfter = &retry
+			return fast
+		}
+		return statusErr{code: status, msg: string(body), retryAfter: &retry, transientRateLimit: true}
+	case helps.ClaudeUsageModelExhausted:
+		logEntry.Info("Claude usage shows only this model's limit is used up; keeping the cooldown on this model")
+		if fast, ok := classified.(*claudeFastDirectResponseError); ok {
+			fast.credentialScoped = false
+			return fast
+		}
+		var retryAfter *time.Duration
+		if rap, ok := classified.(interface{ RetryAfter() *time.Duration }); ok {
+			retryAfter = rap.RetryAfter()
+		}
+		return claudeRateLimitError{statusErr: statusErr{code: status, msg: string(body), retryAfter: retryAfter}}
+	default:
+		logEntry.Info("Claude usage does not contradict the 429; keeping the upstream cooldown")
+		return classified
+	}
+}
+
+// claudeErrorCoolsLong reports whether err would cool the whole credential, or
+// cool the model for longer than claudeLongCooldownThreshold.
+func claudeErrorCoolsLong(err error) bool {
+	if isCS, ok := err.(interface{ IsCredentialScoped() bool }); ok && isCS.IsCredentialScoped() {
+		return true
+	}
+	if isRS, ok := err.(interface{ IsRequestScoped() bool }); ok && isRS.IsRequestScoped() {
+		return false
+	}
+	rap, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		return false
+	}
+	retryAfter := rap.RetryAfter()
+	return retryAfter != nil && *retryAfter > claudeLongCooldownThreshold
+}
+
+// QuotaRecovered implements cliproxyauth.QuotaRecoveryChecker for first-party
+// Claude OAuth credentials: it reports true only when live subscription usage
+// shows room for every listed model.
+func (e *ClaudeExecutor) QuotaRecovered(ctx context.Context, auth *cliproxyauth.Auth, models []string) bool {
+	if e == nil || auth == nil {
+		return false
+	}
+	accessToken, baseURL := claudeCreds(auth)
+	if !helps.IsClaudeOAuthAccessToken(accessToken) {
+		return false
+	}
+	if strings.TrimSpace(baseURL) != "" && !isAnthropicUpstreamBase(baseURL) {
+		return false
+	}
+	userAgent := helps.ResolveClaudeDeviceProfile(auth, accessToken, nil, e.cfg).UserAgent
+	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	if len(models) == 0 {
+		models = []string{""}
+	}
+	for _, model := range models {
+		if e.oauthUsageVerifier.Verdict(ctx, client, accessToken, userAgent, model) != helps.ClaudeUsageAvailable {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }

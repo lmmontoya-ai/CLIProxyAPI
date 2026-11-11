@@ -337,10 +337,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		if fastRequest {
-			return nil, newClaudeFastDirectResponseError(httpResp, b)
-		}
-		return nil, classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, b, e.modelLevelCooling())
+		return nil, e.classifyUpstreamError(ctx, auth, httpReq, httpResp, b, upstreamModel, fastRequest)
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, claudeResponseContentEncoding(httpResp.Header))
 	if err != nil {
