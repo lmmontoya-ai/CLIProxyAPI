@@ -2,79 +2,215 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"sort"
+	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
-// QuotaRecoveryChecker is implemented by executors that can confirm, outside
-// the request path, that a credential in a long quota cooldown has room again.
-// It must return false whenever recovery cannot be confirmed.
+// QuotaRecoveryChecker confirms that a credential in quota cooldown has room
+// again. It must honor ctx and return false when recovery cannot be confirmed.
 type QuotaRecoveryChecker interface {
 	QuotaRecovered(ctx context.Context, auth *Auth, models []string) bool
 }
 
 const (
-	quotaRecoveryInitialDelay = 30 * time.Second
-	quotaRecoveryInterval     = 10 * time.Minute
-	// quotaRecoveryMinRemaining skips cooldowns that will expire soon anyway.
-	quotaRecoveryMinRemaining = 10 * time.Minute
+	quotaRecoveryInterval      = time.Minute
+	quotaRecoveryTimeout       = 3 * time.Second
+	quotaRecoveryMaxConcurrent = 3
+	quotaRecoveryMaxEntries    = 256
+	// Leave short retry windows and transient overload/rate backoffs alone.
+	quotaRecoveryMinRemaining = 30 * time.Second
 )
 
-func (m *Manager) runQuotaRecoveryLoop(ctx context.Context) {
-	timer := time.NewTimer(quotaRecoveryInitialDelay)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-		m.RecoverQuotaCooldowns(ctx)
-		timer.Reset(quotaRecoveryInterval)
-	}
+type quotaRecoveryCall struct {
+	ready     chan struct{}
+	expires   time.Time
+	recovered bool
 }
 
-// RecoverQuotaCooldowns lifts long quota cooldowns that the credential's
-// executor confirms have recovered early, and returns the reset auth IDs.
+type quotaRecoveryState struct {
+	mu     sync.Mutex
+	calls  map[string]*quotaRecoveryCall
+	active int
+}
+
+// recoverQuotaBeforeReject is only reached after selection fails. Normal
+// requests and idle hubs do no usage I/O. Selection is retried at most once.
+func (m *Manager) recoverQuotaBeforeReject(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, err error) bool {
+	if m == nil || err == nil || ctx.Err() != nil || m.HomeEnabled() || m.hasPluginScheduler() {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		return false
+	}
+	providerSet := make(map[string]bool, len(providers))
+	for _, provider := range providers {
+		providerSet[canonicalSchedulingProvider(provider)] = true
+	}
+	pinned := pinnedAuthIDFromMetadata(opts.Metadata)
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	reg := registry.GetGlobalRegistry()
+	candidates := make([]*Auth, 0)
+	for _, auth := range m.List() {
+		if auth == nil || !providerSet[canonicalSchedulingProvider(executorKeyFromAuth(auth))] ||
+			(pinned != "" && auth.ID != pinned) || !eligibility.allows(auth) {
+			continue
+		}
+		if _, used := tried[auth.ID]; used {
+			continue
+		}
+		if !m.authSupportsRouteModel(reg, auth, model) {
+			continue
+		}
+		// Resolve aliases before inspecting which model the request would use.
+		checkModel := m.selectionModelForAuth(auth, model)
+		if !hasLiveQuotaCooldown(auth, checkModel, time.Now()) {
+			continue
+		}
+		candidates = append(candidates, auth)
+	}
+	return len(m.recoverQuotaCandidates(ctx, candidates)) > 0
+}
+
+// RecoverQuotaCooldowns performs an explicit, bounded recovery pass. There is
+// no periodic usage polling; ordinary recovery is triggered by failed selection.
 func (m *Manager) RecoverQuotaCooldowns(ctx context.Context) []string {
 	if m == nil || m.HomeEnabled() {
 		return nil
 	}
-	var reset []string
-	for _, auth := range m.List() {
-		if ctx.Err() != nil {
-			return reset
+	return m.recoverQuotaCandidates(ctx, m.List())
+}
+
+func (m *Manager) recoverQuotaCandidates(ctx context.Context, candidates []*Auth) []string {
+	if ctx.Err() != nil {
+		return nil
+	}
+	// Stable ordering makes concurrent requests join the same checks. Throttled
+	// entries are skipped so later requests can progress through larger pools.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i] == nil {
+			return false
 		}
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return candidates[j] == nil || candidates[i].ID < candidates[j].ID
+	})
+	type pendingCheck struct {
+		id   string
+		call *quotaRecoveryCall
+	}
+	pending := make([]pendingCheck, 0, quotaRecoveryMaxConcurrent)
+	for _, auth := range candidates {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || hasUnauthorizedAuthFailure(auth) {
 			continue
 		}
 		models, ok := longQuotaCooldownModels(auth, time.Now())
 		if !ok {
 			continue
 		}
-		executor, okExecutor := m.Executor(auth.Provider)
-		if !okExecutor {
+		executor, _ := m.Executor(executorKeyFromAuth(auth))
+		checker, ok := executor.(QuotaRecoveryChecker)
+		if !ok {
 			continue
 		}
-		checker, okChecker := executor.(QuotaRecoveryChecker)
-		if !okChecker || !checker.QuotaRecovered(ctx, auth, models) {
-			continue
+		if call := m.startQuotaRecovery(ctx, auth, models, checker); call != nil {
+			pending = append(pending, pendingCheck{auth.ID, call})
 		}
-		if _, _, errReset := m.ResetQuota(ctx, auth.ID); errReset != nil {
-			log.WithError(errReset).WithField("auth", auth.ID).Warn("failed to clear recovered quota cooldown")
-			continue
+		if len(pending) == quotaRecoveryMaxConcurrent {
+			break
 		}
-		log.WithFields(log.Fields{"auth": auth.ID, "models": models}).Info("cleared quota cooldown: live usage shows the credential has room")
-		reset = append(reset, auth.ID)
 	}
-	return reset
+	if len(pending) == 0 {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, quotaRecoveryTimeout)
+	defer cancel()
+	completed := make(chan pendingCheck, len(pending))
+	for _, pending := range pending {
+		go func() {
+			select {
+			case <-pending.call.ready:
+				completed <- pending
+			case <-waitCtx.Done():
+			}
+		}()
+	}
+	for range pending {
+		select {
+		case pending := <-completed:
+			if pending.call.recovered {
+				return []string{pending.id}
+			}
+		case <-waitCtx.Done():
+			return nil
+		}
+	}
+	return nil
 }
 
-// longQuotaCooldownModels returns the models under quota cooldown on auth when
-// at least one quota cooldown outlasts quotaRecoveryMinRemaining. ok is false
-// when there is no such cooldown, or when the auth also carries a restriction
-// that is not about quota, since ResetQuota would clear that too.
+func (m *Manager) startQuotaRecovery(ctx context.Context, auth *Auth, models []string, checker QuotaRecoveryChecker) *quotaRecoveryCall {
+	state := &m.quotaRecovery
+	now := time.Now()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if call := state.calls[auth.ID]; call != nil {
+		select {
+		case <-call.ready:
+			if now.Before(call.expires) {
+				return nil
+			}
+		default:
+			return call
+		}
+	}
+	if state.calls == nil {
+		state.calls = make(map[string]*quotaRecoveryCall)
+	}
+	for id, call := range state.calls {
+		select {
+		case <-call.ready:
+			if !now.Before(call.expires) {
+				delete(state.calls, id)
+			}
+		default:
+		}
+	}
+	if state.active >= quotaRecoveryMaxConcurrent || len(state.calls) >= quotaRecoveryMaxEntries {
+		return nil
+	}
+	call := &quotaRecoveryCall{ready: make(chan struct{})}
+	state.calls[auth.ID] = call
+	state.active++
+	go func() {
+		// A canceled waiter must not cancel a lookup shared by other requests.
+		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaRecoveryTimeout)
+		defer cancel()
+		recovered := false
+		if checker.QuotaRecovered(checkCtx, auth, models) && checkCtx.Err() == nil {
+			updated, _, errReset := m.resetQuota(checkCtx, auth.ID, auth)
+			if errReset != nil {
+				log.Warnf("quota recovery failed: auth=%s error=%v", auth.ID, errReset)
+			} else if updated != nil {
+				recovered = true
+				log.Infof("cleared quota cooldown after usage check: auth=%s models=%v", auth.ID, models)
+			}
+		}
+		state.mu.Lock()
+		call.recovered = recovered
+		call.expires = time.Now().Add(quotaRecoveryInterval)
+		state.active--
+		close(call.ready)
+		state.mu.Unlock()
+	}()
+	return call
+}
+
+// A whole-credential reset requires confirmed room for every blocked model.
+// Never erase transient rate/overload backoff, authentication or other errors.
 func longQuotaCooldownModels(auth *Auth, now time.Time) (models []string, ok bool) {
 	long := false
 	for _, view := range CooldownSnapshotForAuth(auth, now) {
@@ -86,7 +222,6 @@ func longQuotaCooldownModels(auth *Auth, now time.Time) (models []string, ok boo
 			if view.ModelKey != "" {
 				models = append(models, view.ModelKey)
 			}
-		case "transient_error", "transient_rate_limit":
 		default:
 			return nil, false
 		}

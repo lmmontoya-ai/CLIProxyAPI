@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,8 +49,9 @@ func (v ClaudeUsageVerdict) String() string {
 
 const (
 	claudeUsageURL            = "https://api.anthropic.com/api/oauth/usage"
-	claudeUsageCacheTTL       = 30 * time.Second
+	claudeUsageCacheTTL       = time.Minute
 	claudeUsageFetchTimeout   = 3 * time.Second
+	claudeUsageMaxConcurrent  = 3
 	claudeUsageMaxEntries     = 256
 	claudeUsageMaxBody        = 64 * 1024
 	claudeContradictionWindow = 2 * time.Hour
@@ -108,7 +110,7 @@ func IsClaudeOAuthAccessToken(token string) bool {
 
 // Verdict compares model against the account's live usage.
 func (v *ClaudeUsageVerifier) Verdict(ctx context.Context, client *http.Client, accessToken, userAgent, model string) ClaudeUsageVerdict {
-	if v == nil || client == nil || !IsClaudeOAuthAccessToken(accessToken) {
+	if v == nil || client == nil || ctx.Err() != nil || !IsClaudeOAuthAccessToken(accessToken) {
 		return ClaudeUsageUnknown
 	}
 	body := v.snapshot(ctx, client, accessToken, userAgent)
@@ -177,6 +179,7 @@ func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client,
 	if v.checks == nil {
 		v.checks = make(map[[32]byte]*claudeUsageCheck)
 	}
+	active := 0
 	for k, entry := range v.checks {
 		select {
 		case <-entry.ready:
@@ -184,9 +187,10 @@ func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client,
 				delete(v.checks, k)
 			}
 		default:
+			active++
 		}
 	}
-	if len(v.checks) >= claudeUsageMaxEntries {
+	if active >= claudeUsageMaxConcurrent || len(v.checks) >= claudeUsageMaxEntries {
 		v.mu.Unlock()
 		return nil
 	}
@@ -201,15 +205,21 @@ func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client,
 	// The lookup must not inherit one request's cancellation: other callers may
 	// be waiting on it. Its own timeout bounds it instead.
 	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeUsageFetchTimeout)
-	body := fetch(fetchCtx, client, accessToken, userAgent)
-	cancel()
-
-	v.mu.Lock()
-	entry.body = body
-	entry.expires = v.now().Add(claudeUsageCacheTTL)
-	close(entry.ready)
-	v.mu.Unlock()
-	return body
+	go func() {
+		defer cancel()
+		body := fetch(fetchCtx, client, accessToken, userAgent)
+		v.mu.Lock()
+		entry.body = body
+		entry.expires = v.now().Add(claudeUsageCacheTTL)
+		close(entry.ready)
+		v.mu.Unlock()
+	}()
+	select {
+	case <-entry.ready:
+		return entry.body
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 func fetchClaudeUsage(ctx context.Context, client *http.Client, accessToken, userAgent string) []byte {
@@ -227,12 +237,16 @@ func fetchClaudeUsage(ctx context.Context, client *http.Client, accessToken, use
 	usageClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, errFetch := usageClient.Do(req)
 	if errFetch != nil {
-		LogWithRequestID(ctx).Warn("Claude usage lookup failed; keeping upstream cooldown")
+		reason := "transport_error"
+		if ctx.Err() != nil {
+			reason = "timeout_or_canceled"
+		}
+		LogWithRequestID(ctx).WithField("reason", reason).Warn("Claude usage lookup failed; keeping upstream cooldown")
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		LogWithRequestID(ctx).WithField("usage_status", resp.StatusCode).Warn("Claude usage lookup unavailable; keeping upstream cooldown")
+		LogWithRequestID(ctx).Warnf("Claude usage lookup returned HTTP %d; keeping upstream cooldown", resp.StatusCode)
 		return nil
 	}
 	body, errRead := io.ReadAll(io.LimitReader(resp.Body, claudeUsageMaxBody+1))
@@ -473,9 +487,15 @@ func LogClaudeRateLimitHeaders(ctx context.Context, status int, headers http.Hea
 		return
 	}
 	sort.Strings(keys)
-	fields := log.Fields{"upstream_status": status, "model": model}
+	// The application's text formatter only prints allowlisted fields. Put the
+	// safe header summary in reason so it survives both text and JSON logging.
+	values := make([]string, 0, len(keys))
 	for _, key := range keys {
-		fields[strings.TrimPrefix(key, "anthropic-ratelimit-")] = getHeaderCaseInsensitive(headers, key)
+		value := getHeaderCaseInsensitive(headers, key)
+		if len(value) > 256 {
+			value = value[:256]
+		}
+		values = append(values, strings.TrimPrefix(key, "anthropic-ratelimit-")+"="+strconv.Quote(value))
 	}
-	LogWithRequestID(ctx).WithFields(fields).Warn("Claude upstream rejection headers")
+	LogWithRequestID(ctx).WithFields(log.Fields{"model": model, "reason": strings.Join(values, " ")}).Warnf("Claude upstream rejection headers: HTTP %d", status)
 }

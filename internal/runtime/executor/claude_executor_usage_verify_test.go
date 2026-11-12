@@ -125,11 +125,6 @@ func TestClaudeClassifyUpstreamError_ModelOnlyExhaustionStaysOnModel(t *testing.
 
 func TestClaudeClassifyUpstreamError_SkipsUsageLookupWhenItCannotHelp(t *testing.T) {
 	shortRetry := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{"20"}}}
-	overload := &http.Response{StatusCode: 529, Header: http.Header{
-		"Retry-After":                        []string{"15"},
-		"Anthropic-Ratelimit-Unified-Status": []string{"rejected"},
-		"Anthropic-Ratelimit-Unified-Reset":  []string{strconv.FormatInt(time.Now().Add(75*time.Hour).Unix(), 10)},
-	}}
 	tests := []struct {
 		name  string
 		token string
@@ -137,7 +132,6 @@ func TestClaudeClassifyUpstreamError_SkipsUsageLookupWhenItCannotHelp(t *testing
 	}{
 		{name: "short retry", token: "sk-ant-oat01-test", resp: shortRetry},
 		{name: "API key", token: "sk-ant-api03-key", resp: weeklyRejection429()},
-		{name: "overload", token: "sk-ant-oat01-test", resp: overload},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -195,3 +189,37 @@ func TestClaudeExecutorQuotaRecovered(t *testing.T) {
 }
 
 var _ cliproxyauth.QuotaRecoveryChecker = (*ClaudeExecutor)(nil)
+
+func TestClaudeClassifyOverloadChecksUsageWithoutErasingOverload(t *testing.T) {
+	for name, usage := range map[string]string{
+		"available":   `{"five_hour":null,"seven_day":{"utilization":10}}`,
+		"exhausted":   `{"five_hour":null,"seven_day":{"utilization":100}}`,
+		"unavailable": "",
+	} {
+		for _, fast := range []bool{false, true} {
+			t.Run(name+strconv.FormatBool(fast), func(t *testing.T) {
+				var calls atomic.Int32
+				e := newClaudeUsageTestExecutor(usage, &calls)
+				response := weeklyRejection429()
+				response.StatusCode = 529
+				response.Header.Set("Retry-After", "15")
+				for i := 0; i < 5; i++ {
+					err := e.classifyUpstreamError(context.Background(), claudeUsageTestAuth("sk-ant-oat01-test"), claudeUsageTestRequest(t), response, []byte(`{"error":{"type":"overloaded_error","message":"Overloaded"}}`), "claude-opus-5-5", fast)
+					cs, tr, retry := errorScope(t, err)
+					var status interface{ StatusCode() int }
+					retryOK := retry != nil && *retry == 15*time.Second
+					if fast {
+						var direct *cliproxyexecutor.RequestTerminatedError
+						retryOK = retry == nil && errors.As(err, &direct) && direct.ResponseHeaders().Get("Retry-After") == "15"
+					}
+					if !errors.As(err, &status) || status.StatusCode() != 529 || cs || tr || !retryOK {
+						t.Fatalf("overload altered: %T %v scope=%v transient=%v retry=%v", err, err, cs, tr, retry)
+					}
+				}
+				if calls.Load() != 1 {
+					t.Fatalf("usage calls=%d, want cached single lookup", calls.Load())
+				}
+			})
+		}
+	}
+}

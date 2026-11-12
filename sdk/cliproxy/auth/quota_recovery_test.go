@@ -2,8 +2,12 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"testing"
 	"time"
 
@@ -16,10 +20,14 @@ type quotaRecoveryExecutor struct {
 	recovered bool
 	checks    atomic.Int32
 	models    []string
+	check     func(context.Context, *Auth, []string) bool
 }
 
-func (e *quotaRecoveryExecutor) QuotaRecovered(_ context.Context, _ *Auth, models []string) bool {
+func (e *quotaRecoveryExecutor) QuotaRecovered(ctx context.Context, auth *Auth, models []string) bool {
 	e.checks.Add(1)
+	if e.check != nil {
+		return e.check(ctx, auth, models)
+	}
 	e.models = append([]string(nil), models...)
 	return e.recovered
 }
@@ -84,7 +92,7 @@ func TestRecoverQuotaCooldownsKeepsUnconfirmedLockout(t *testing.T) {
 func TestRecoverQuotaCooldownsSkipsShortCooldownsAndUnsupportedExecutors(t *testing.T) {
 	executor := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
 	manager, auth := newQuotaRecoveryManager(t, executor)
-	markClaudeQuota(manager, auth.ID, "claude-opus-5-5", 2*time.Minute, false)
+	markClaudeQuota(manager, auth.ID, "claude-opus-5-5", 20*time.Second, false)
 	if reset := manager.RecoverQuotaCooldowns(context.Background()); len(reset) != 0 || executor.checks.Load() != 0 {
 		t.Fatalf("short cooldown: reset=%v checks=%d, want no check", reset, executor.checks.Load())
 	}
@@ -108,5 +116,220 @@ func TestRecoverQuotaCooldownsSkipsNonQuotaRestrictions(t *testing.T) {
 	})
 	if reset := manager.RecoverQuotaCooldowns(context.Background()); len(reset) != 0 || executor.checks.Load() != 0 {
 		t.Fatalf("reset=%v checks=%d, want the auth left alone", reset, executor.checks.Load())
+	}
+}
+
+func TestQuotaRecoveryRetriesSelectionForCurrentRequest(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, mixed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("legacy=%v/mixed=%v", legacy, mixed), func(t *testing.T) {
+				e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+				m, a := newQuotaRecoveryManager(t, e)
+				if legacy {
+					s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &RoundRobinSelector{}})
+					m.SetSelector(s)
+					t.Cleanup(s.Stop)
+				}
+				markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Hour, true)
+				var selected *Auth
+				var err error
+				if mixed {
+					selected, _, _, err = m.pickNextMixed(context.Background(), []string{"claude"}, "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+				} else {
+					selected, _, err = m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+				}
+				if err != nil || selected == nil || selected.ID != a.ID || e.checks.Load() != 1 {
+					t.Fatalf("selected=%v err=%v checks=%d", selected, err, e.checks.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestQuotaRecoveryExecutesSameRequest(t *testing.T) {
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Hour, false)
+	response, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-5-5", Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
+	if err != nil || string(response.Payload) != `{"ok":true}` || e.calls.Load() != 1 {
+		t.Fatalf("response=%s err=%v calls=%d", response.Payload, err, e.calls.Load())
+	}
+}
+
+func TestQuotaRecoveryThrottlesFailuresAndRechecksAfterInterval(t *testing.T) {
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Hour, true)
+	for i := 0; i < 10; i++ {
+		_, _, err := m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+		if err == nil {
+			t.Fatal("unconfirmed cooldown was lifted")
+		}
+	}
+	if e.checks.Load() != 1 {
+		t.Fatalf("checks=%d, want 1", e.checks.Load())
+	}
+	m.quotaRecovery.mu.Lock()
+	m.quotaRecovery.calls[a.ID].expires = time.Now().Add(-time.Second)
+	m.quotaRecovery.mu.Unlock()
+	e.recovered = true
+	selected, _, err := m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+	if err != nil || selected == nil || e.checks.Load() != 2 {
+		t.Fatalf("err=%v checks=%d", err, e.checks.Load())
+	}
+}
+
+func TestQuotaRecoveryPreservesTransientBackoff(t *testing.T) {
+	for _, status := range []int{429, 529} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+			m, a := newQuotaRecoveryManager(t, e)
+			retry := time.Hour
+			resultErr := &Error{HTTPStatus: status, Message: "temporary failure"}
+			if status == 429 {
+				resultErr.Code = transientRateLimitErrorCode
+			}
+			m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: "claude", Model: "claude-opus-5-5", RetryAfter: &retry, Error: resultErr})
+			m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+			if e.checks.Load() != 0 {
+				t.Fatalf("checks=%d, want no quota recovery", e.checks.Load())
+			}
+			updated, _ := m.GetByID(a.ID)
+			if len(CooldownSnapshotForAuth(updated, time.Now())) == 0 {
+				t.Fatal("transient backoff erased")
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryDoesNotRecheckHealthyOrAlreadyTriedCredentials(t *testing.T) {
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+	m, a := newQuotaRecoveryManager(t, e)
+	if _, _, err := m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Hour, true)
+	m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, map[string]struct{}{a.ID: {}})
+	if e.checks.Load() != 0 {
+		t.Fatalf("checks=%d, want no checks", e.checks.Load())
+	}
+}
+
+func TestQuotaRecoverySharesChecksAndRespectsCancellation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, check: func(context.Context, *Auth, []string) bool {
+		close(started)
+		<-release
+		return true
+	}}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Hour, true)
+	snapshot, _ := m.GetByID(a.ID)
+	ctx, cancel := context.WithCancel(context.Background())
+	first := m.startQuotaRecovery(ctx, snapshot, []string{"claude-opus-5-5"}, e)
+	<-started
+	second := m.startQuotaRecovery(context.Background(), snapshot, []string{"claude-opus-5-5"}, e)
+	if first != second {
+		t.Fatal("concurrent callers did not share the lookup")
+	}
+	cancel()
+	if reset := m.RecoverQuotaCooldowns(ctx); len(reset) != 0 {
+		t.Fatal("canceled caller should not wait")
+	}
+	close(release)
+	<-second.ready
+	if !second.recovered || e.checks.Load() != 1 {
+		t.Fatalf("recovered=%v checks=%d", second.recovered, e.checks.Load())
+	}
+}
+
+func TestQuotaRecoveryNeverClearsNewerFailures(t *testing.T) {
+	for _, status := range []int{401, 429, 529} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, check: func(context.Context, *Auth, []string) bool { close(started); <-release; return true }}
+			m, a := newQuotaRecoveryManager(t, e)
+			markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, true)
+			snapshot, _ := m.GetByID(a.ID)
+			call := m.startQuotaRecovery(context.Background(), snapshot, []string{"claude-opus-5-5"}, e)
+			<-started
+			retry := 3 * time.Hour
+			m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: "claude", Model: "claude-opus-5-5", RetryAfter: &retry, Error: &Error{HTTPStatus: status, Message: "newer failure"}})
+			close(release)
+			<-call.ready
+			if call.recovered {
+				t.Fatal("stale usage check erased a newer failure")
+			}
+			updated, _ := m.GetByID(a.ID)
+			if state := existingModelState(updated, "claude-opus-5-5"); state == nil || state.LastError == nil || state.LastError.HTTPStatus != status {
+				t.Fatal("new failure was erased")
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryBoundsGlobalConcurrencyAndAdvancesThroughPool(t *testing.T) {
+	started, release := make(chan struct{}, 10), make(chan struct{})
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, check: func(context.Context, *Auth, []string) bool { started <- struct{}{}; <-release; return false }}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, true)
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("extra-%s-%d", a.ID, i)
+		if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "claude"}); err != nil {
+			t.Fatal(err)
+		}
+		markClaudeQuota(m, id, "claude-opus-5-5", time.Hour, true)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); m.RecoverQuotaCooldowns(context.Background()) }()
+	}
+	for i := 0; i < quotaRecoveryMaxConcurrent; i++ {
+		<-started
+	}
+	if e.checks.Load() != quotaRecoveryMaxConcurrent {
+		t.Fatalf("checks=%d", e.checks.Load())
+	}
+	close(release)
+	wg.Wait()
+	// Completed entries remain throttled, allowing another pass to reach the rest.
+	m.RecoverQuotaCooldowns(context.Background())
+	if e.checks.Load() <= quotaRecoveryMaxConcurrent {
+		t.Fatal("later candidates starved behind throttled entries")
+	}
+}
+
+func TestQuotaRecoveryUsesReadyAccountWithoutWaitingForSlowAccount(t *testing.T) {
+	slowStarted, release := make(chan struct{}), make(chan struct{})
+	var slowID string
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, check: func(_ context.Context, a *Auth, _ []string) bool {
+		if a.ID == slowID {
+			close(slowStarted)
+			<-release
+			return false
+		}
+		<-slowStarted
+		return true
+	}}
+	m, a := newQuotaRecoveryManager(t, e)
+	slowID = a.ID
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, true)
+	fastID := "z-" + a.ID
+	if _, err := m.Register(context.Background(), &Auth{ID: fastID, Provider: "claude"}); err != nil {
+		t.Fatal(err)
+	}
+	markClaudeQuota(m, fastID, "claude-opus-5-5", time.Hour, true)
+	t.Cleanup(func() {
+		close(release)
+		m.quotaRecovery.mu.Lock()
+		call := m.quotaRecovery.calls[slowID]
+		m.quotaRecovery.mu.Unlock()
+		if call != nil {
+			<-call.ready
+		}
+	})
+	if reset := m.RecoverQuotaCooldowns(context.Background()); len(reset) != 1 || reset[0] != fastID {
+		t.Fatalf("reset=%v, want ready account without waiting for slow one", reset)
 	}
 }

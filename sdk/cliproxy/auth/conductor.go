@@ -235,6 +235,7 @@ type Manager struct {
 	refreshJobs map[string]*authRefreshJob
 
 	requestPrepareLocks sync.Map
+	quotaRecovery       quotaRecoveryState
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map

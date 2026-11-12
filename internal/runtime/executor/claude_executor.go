@@ -365,7 +365,7 @@ func (e *ClaudeExecutor) classifyUpstreamError(ctx context.Context, auth *clipro
 	} else {
 		classified = classifyClaudeUpstreamErrorWithCooling(status, response.Header, body, e.modelLevelCooling())
 	}
-	if status != http.StatusTooManyRequests || claudeBodyIndicatesFastModeCredits(body) || !claudeErrorCoolsLong(classified) {
+	if status != 529 && (status != http.StatusTooManyRequests || claudeBodyIndicatesFastModeCredits(body) || !claudeErrorCoolsLong(classified)) {
 		return classified
 	}
 	if request == nil || !isAnthropicUpstreamURL(request.URL) || auth == nil {
@@ -376,11 +376,17 @@ func (e *ClaudeExecutor) classifyUpstreamError(ctx context.Context, auth *clipro
 		return classified
 	}
 	verdict := e.oauthUsageVerifier.Verdict(ctx, helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0), accessToken, request.Header.Get("User-Agent"), model)
-	logEntry := helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth": auth.ID, "model": model, "usage_verdict": verdict.String()})
+	logEntry := helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth_id": auth.ID, "model": model, "reason": "usage=" + verdict.String()})
+	if status == 529 {
+		// Subscription capacity cannot disprove upstream overload. Check it for
+		// visibility, but retain Retry-After and normal failover/backoff.
+		logEntry.Info("Claude overload usage check; keeping overload backoff")
+		return classified
+	}
 	switch verdict {
 	case helps.ClaudeUsageAvailable:
 		retry := e.oauthUsageVerifier.ContradictionRetryAfter(auth.ID, model)
-		logEntry.WithField("model_cooldown", retry.String()).Warn("Claude 429 contradicts live usage; cooling only this model briefly")
+		logEntry.Warnf("Claude 429 contradicts live usage; cooling only this model for %s", retry)
 		if fast, ok := classified.(*claudeFastDirectResponseError); ok {
 			fast.credentialScoped = false
 			fast.retryAfter = &retry
@@ -399,7 +405,7 @@ func (e *ClaudeExecutor) classifyUpstreamError(ctx context.Context, auth *clipro
 		}
 		return claudeRateLimitError{statusErr: statusErr{code: status, msg: string(body), retryAfter: retryAfter}}
 	default:
-		logEntry.Info("Claude usage does not contradict the 429; keeping the upstream cooldown")
+		logEntry.Info("Claude usage check; keeping upstream 429 cooldown")
 		return classified
 	}
 }

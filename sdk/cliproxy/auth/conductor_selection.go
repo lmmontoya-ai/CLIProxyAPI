@@ -2551,6 +2551,14 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	auth, executor, err := m.pickNextOnce(ctx, provider, model, opts, tried)
+	if m.recoverQuotaBeforeReject(ctx, []string{provider}, model, opts, tried, err) {
+		return m.pickNextOnce(ctx, provider, model, opts, tried)
+	}
+	return auth, executor, err
+}
+
+func (m *Manager) pickNextOnce(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
 	if m.HomeEnabled() {
@@ -2864,6 +2872,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	auth, executor, provider, err := m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	if m.recoverQuotaBeforeReject(ctx, providers, model, opts, tried, err) {
+		return m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	}
+	return auth, executor, provider, err
+}
+
+func (m *Manager) pickNextMixedOnce(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
 	if m.HomeEnabled() {

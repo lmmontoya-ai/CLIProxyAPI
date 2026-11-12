@@ -128,10 +128,13 @@ func TestClaudeUsageVerifierCachesAndSharesLookups(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	var calls atomic.Int32
 	release := make(chan struct{})
+	started := make(chan struct{})
 	verifier := &ClaudeUsageVerifier{
 		NowFunc: func() time.Time { return now },
 		Fetch: func(context.Context, *http.Client, string, string) []byte {
-			calls.Add(1)
+			if calls.Add(1) == 1 {
+				close(started)
+			}
 			<-release
 			return []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`)
 		},
@@ -146,7 +149,7 @@ func TestClaudeUsageVerifierCachesAndSharesLookups(t *testing.T) {
 			results[i] = verifier.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5")
 		}(i)
 	}
-	time.Sleep(50 * time.Millisecond)
+	<-started
 	close(release)
 	wg.Wait()
 	for i, got := range results {
@@ -219,4 +222,71 @@ func TestClaudeOverloadRetryAfterIgnoresQuotaResetHeaders(t *testing.T) {
 	if got == nil || *got != 20*time.Second {
 		t.Fatalf("529 retry = %v, want 20s", got)
 	}
+}
+
+func TestClaudeUsageVerifierCachesFailures(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	var calls atomic.Int32
+	v := &ClaudeUsageVerifier{NowFunc: func() time.Time { return now }, Fetch: func(context.Context, *http.Client, string, string) []byte { calls.Add(1); return nil }}
+	for i := 0; i < 10; i++ {
+		v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("failed lookups=%d, want one per cache window", calls.Load())
+	}
+	now = now.Add(claudeUsageCacheTTL + time.Second)
+	v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5")
+	if calls.Load() != 2 {
+		t.Fatalf("lookups=%d after cache expiry", calls.Load())
+	}
+}
+
+func TestClaudeUsageVerifierCanceledLeaderDoesNotCancelSharedLookup(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	v := &ClaudeUsageVerifier{Fetch: func(ctx context.Context, _ *http.Client, _, _ string) []byte {
+		close(started)
+		select {
+		case <-release:
+			return []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`)
+		case <-ctx.Done():
+			return nil
+		}
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan ClaudeUsageVerdict, 1)
+	go func() { result <- v.Verdict(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5") }()
+	<-started
+	cancel()
+	if got := <-result; got != ClaudeUsageUnknown {
+		t.Fatalf("canceled caller got %s", got)
+	}
+	close(release)
+	if got := v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5"); got != ClaudeUsageAvailable {
+		t.Fatalf("shared caller got %s", got)
+	}
+}
+
+func TestClaudeUsageVerifierBoundsConcurrentAccounts(t *testing.T) {
+	started, release := make(chan struct{}, claudeUsageMaxConcurrent), make(chan struct{})
+	v := &ClaudeUsageVerifier{Fetch: func(context.Context, *http.Client, string, string) []byte {
+		started <- struct{}{}
+		<-release
+		return nil
+	}}
+	var wg sync.WaitGroup
+	for i := 0; i < claudeUsageMaxConcurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken+string(rune('a'+i)), "", "claude-opus-5-5")
+		}()
+	}
+	for i := 0; i < claudeUsageMaxConcurrent; i++ {
+		<-started
+	}
+	if got := v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken+"extra", "", "claude-opus-5-5"); got != ClaudeUsageUnknown {
+		t.Fatalf("capacity overflow got %s", got)
+	}
+	close(release)
+	wg.Wait()
 }
