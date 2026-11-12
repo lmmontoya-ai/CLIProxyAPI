@@ -290,3 +290,20 @@ func TestClaudeUsageVerifierBoundsConcurrentAccounts(t *testing.T) {
 	close(release)
 	wg.Wait()
 }
+
+func TestClaudeUsageVerdictRejectsMalformedKnownWindows(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty weekly":           `{"five_hour":null,"seven_day":{}}`,
+		"null utilization":       `{"five_hour":null,"seven_day":{"utilization":null}}`,
+		"empty session":          `{"five_hour":{},"seven_day":{"utilization":10}}`,
+		"invalid session type":   `{"five_hour":false,"seven_day":{"utilization":10}}`,
+		"malformed family":       `{"five_hour":null,"seven_day":{"utilization":10},"seven_day_opus":{}}`,
+		"malformed OAuth window": `{"five_hour":null,"seven_day":{"utilization":10},"seven_day_oauth_apps":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ClaudeUsageVerdictFromBody([]byte(body), "claude-opus-5-5"); got != ClaudeUsageUnknown {
+				t.Fatalf("verdict=%s, want unknown for malformed window", got)
+			}
+		})
+	}
+}

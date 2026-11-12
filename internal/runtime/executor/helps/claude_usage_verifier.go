@@ -301,6 +301,14 @@ func ClaudeUsageVerdictFromBody(body []byte, model string) ClaudeUsageVerdict {
 	sharedExhausted, modelExhausted, unknown := false, false, false
 	root.ForEach(func(key, window ojson.Result) bool {
 		name := key.String()
+		// Known active windows must positively report a numeric utilization.
+		// Missing data is not evidence that the account has room.
+		if (claudeSharedUsageWindows[name] || claudeFamilyUsageWindows[name] != "") && window.Type != ojson.Null {
+			if !window.IsObject() || !validClaudeUsagePercent(window.Get("utilization")) {
+				unknown = true
+				return false
+			}
+		}
 		if claudeIgnoredUsageWindows[name] || !window.IsObject() {
 			return true
 		}
