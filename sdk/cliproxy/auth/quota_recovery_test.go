@@ -333,3 +333,106 @@ func TestQuotaRecoveryUsesReadyAccountWithoutWaitingForSlowAccount(t *testing.T)
 		t.Fatalf("reset=%v, want ready account without waiting for slow one", reset)
 	}
 }
+
+func TestQuotaRecoveryPreservesHiddenNonQuotaBackoff(t *testing.T) {
+	for _, status := range []int{429, 529} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+			m, a := newQuotaRecoveryManager(t, e)
+			retry := time.Hour
+			resultErr := &Error{HTTPStatus: status, Message: "temporary failure"}
+			if status == 429 {
+				resultErr.Code = transientRateLimitErrorCode
+			}
+			m.MarkResult(context.Background(), Result{AuthID: a.ID, Provider: "claude", Model: "claude-opus-5-5", RetryAfter: &retry, Error: resultErr})
+			markClaudeQuota(m, a.ID, "claude-fable-5-2", 2*time.Hour, true)
+			before, _ := m.GetByID(a.ID)
+			state := existingModelState(before, "claude-opus-5-5")
+			if state == nil || state.credentialQuotaShadow == nil || state.credentialQuotaShadow.LastError == nil || state.credentialQuotaShadow.LastError.HTTPStatus != status {
+				t.Fatal("setup failed: expected live independent non-quota shadow")
+			}
+			t.Logf("before views=%+v", CooldownSnapshotForAuth(before, time.Now()))
+			reset := m.RecoverQuotaCooldowns(context.Background())
+			after, _ := m.GetByID(a.ID)
+			t.Logf("reset=%v checks=%d after=%+v", reset, e.checks.Load(), CooldownSnapshotForAuth(after, time.Now()))
+			if len(reset) > 0 || e.checks.Load() != 0 {
+				t.Fatal("automatic quota recovery must skip live independent non-quota backoff")
+			}
+			if _, ok := longQuotaCooldownModels(before, time.Now().Add(90*time.Minute)); !ok {
+				t.Fatal("expired independent backoff should no longer prevent quota recovery")
+			}
+			if len(CooldownSnapshotForAuth(after, time.Now())) == 0 {
+				t.Fatal("quota restrictions were erased")
+			}
+			preserved := existingModelState(after, "claude-opus-5-5")
+			if preserved == nil || preserved.credentialQuotaShadow == nil || !preserved.credentialQuotaShadow.NextRetryAfter.Equal(state.credentialQuotaShadow.NextRetryAfter) {
+				t.Fatal("independent retry deadline changed")
+			}
+
+		})
+	}
+}
+
+func TestQuotaRecoveryCanClearIndependentQuotaShadow(t *testing.T) {
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, false)
+	markClaudeQuota(m, a.ID, "claude-fable-5-2", 2*time.Hour, true)
+	if reset := m.RecoverQuotaCooldowns(context.Background()); len(reset) != 1 || e.checks.Load() != 1 {
+		t.Fatalf("reset=%v checks=%d, want confirmed recovery of both quota layers", reset, e.checks.Load())
+	}
+	if len(e.models) != 2 {
+		t.Fatalf("checked models=%v, want both cooled models", e.models)
+	}
+}
+
+func TestQuotaRecoveryNeverClearsReplacementCredential(t *testing.T) {
+	for _, reregister := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reregister=%v", reregister), func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, check: func(context.Context, *Auth, []string) bool { close(started); <-release; return true }}
+			m, a := newQuotaRecoveryManager(t, e)
+			markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, true)
+			before, _ := m.GetByID(a.ID)
+			call := m.startQuotaRecovery(context.Background(), before, []string{"claude-opus-5-5"}, e)
+			<-started
+			var changed *Auth
+			var err error
+			if reregister {
+				m.Remove(context.Background(), a.ID)
+				changed, err = m.Register(context.Background(), &Auth{ID: a.ID, Provider: "claude", Attributes: map[string]string{"api_key": "new-key"}})
+			} else {
+				updated := before.Clone()
+				updated.Attributes["api_key"] = "new-key"
+				changed, err = m.Update(context.Background(), updated)
+			}
+			if err != nil {
+				close(release)
+				<-call.ready
+				t.Fatal(err)
+			}
+			retry := 3 * time.Hour
+			m.MarkResult(context.Background(), Result{
+				AuthID: a.ID, Provider: "claude", Model: "claude-opus-5-5",
+				CredentialVersion: changed.CredentialVersion, RegistrationEpoch: changed.RegistrationEpoch,
+				RetryAfter: &retry, CredentialScope: true,
+				Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "new credential quota"},
+			})
+			close(release)
+			<-call.ready
+			if call.recovered {
+				t.Fatal("usage for old credentials cleared replacement cooldown")
+			}
+			if reregister && changed.RegistrationEpoch == before.RegistrationEpoch {
+				t.Fatal("test did not advance registration epoch")
+			}
+			if !reregister && changed.CredentialVersion == before.CredentialVersion {
+				t.Fatal("test did not advance credential version")
+			}
+			after, _ := m.GetByID(a.ID)
+			if !after.Quota.Exceeded || after.Quota.NextRecoverAt.Sub(time.Now()) < 2*time.Hour {
+				t.Fatal("replacement cooldown was cleared")
+			}
+		})
+	}
+}

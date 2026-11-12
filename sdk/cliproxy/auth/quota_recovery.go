@@ -212,6 +212,35 @@ func (m *Manager) startQuotaRecovery(ctx context.Context, auth *Auth, models []s
 // A whole-credential reset requires confirmed room for every blocked model.
 // Never erase transient rate/overload backoff, authentication or other errors.
 func longQuotaCooldownModels(auth *Auth, now time.Time) (models []string, ok bool) {
+	if auth == nil {
+		return nil, false
+	}
+	// The public snapshot only shows the effective outer quota deadline. A
+	// shorter independent restriction can still be live underneath that layer,
+	// and a whole-credential reset would erase it too.
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Status == StatusDisabled {
+			return nil, false
+		}
+		shadow := state.credentialQuotaShadow
+		if shadow == nil {
+			continue
+		}
+		if shadow.Status == StatusDisabled {
+			return nil, false
+		}
+		blocked, _, next := availabilityBlock(shadow.Unavailable, shadow.Quota.Exceeded, shadow.NextRetryAfter, shadow.Quota.NextRecoverAt, now)
+		if !blocked {
+			continue
+		}
+		view := newCooldownView("model", "", next, now, shadow.Quota, shadow.StatusMessage, shadow.LastError)
+		if view.Reason != "quota" && view.Reason != "credential_quota" {
+			return nil, false
+		}
+	}
 	long := false
 	for _, view := range CooldownSnapshotForAuth(auth, now) {
 		switch view.Reason {

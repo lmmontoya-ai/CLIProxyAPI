@@ -24,7 +24,8 @@ checks. Canceling one request does not cancel a lookup shared by other callers.
 
 Automatic recovery requires available usage for every model whose quota state
 would be cleared. Unknown results, API keys, custom upstreams, disabled or
-unauthorized credentials, and non-quota restrictions do not qualify. Ordinary
+unauthorized credentials, and non-quota restrictions do not qualify. This also
+includes independent model restrictions hidden under a credential quota. Ordinary
 rate backoff and overload backoff are never removed by a quota recovery check.
 A credential replacement or a newer result arriving during a lookup invalidates
 the attempted reset. Existing pinning, eligibility, aliases, and session routing
