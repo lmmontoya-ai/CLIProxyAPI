@@ -375,14 +375,16 @@ func (e *ClaudeExecutor) classifyUpstreamError(ctx context.Context, auth *clipro
 	if !helps.IsClaudeOAuthAccessToken(accessToken) {
 		return classified
 	}
-	verdict := e.oauthUsageVerifier.Verdict(ctx, helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0), accessToken, request.Header.Get("User-Agent"), model)
-	logEntry := helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth_id": auth.ID, "model": model, "reason": "usage=" + verdict.String()})
+	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	if status == 529 {
-		// Subscription capacity cannot disprove upstream overload. Check it for
-		// visibility, but retain Retry-After and normal failover/backoff.
-		logEntry.Info("Claude overload usage check; keeping overload backoff")
+		// Subscription capacity cannot disprove overload. Warm the shared
+		// snapshot without adding usage latency to failover or the response.
+		verdict := e.oauthUsageVerifier.Observe(ctx, client, accessToken, request.Header.Get("User-Agent"), model)
+		helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth_id": auth.ID, "model": model, "reason": "usage=" + verdict.String()}).Info("Claude overload usage observation; keeping overload backoff")
 		return classified
 	}
+	verdict := e.oauthUsageVerifier.Verdict(ctx, client, accessToken, request.Header.Get("User-Agent"), model)
+	logEntry := helps.LogWithRequestID(ctx).WithFields(log.Fields{"auth_id": auth.ID, "model": model, "reason": "usage=" + verdict.String()})
 	switch verdict {
 	case helps.ClaudeUsageAvailable:
 		retry := e.oauthUsageVerifier.ContradictionRetryAfter(auth.ID, model)
@@ -431,15 +433,18 @@ func claudeErrorCoolsLong(err error) bool {
 // Claude OAuth credentials: it reports true only when live subscription usage
 // shows room for every listed model.
 func (e *ClaudeExecutor) QuotaRecovered(ctx context.Context, auth *cliproxyauth.Auth, models []string) bool {
+	return e.ProbeQuotaRecovery(ctx, auth, models) == cliproxyauth.QuotaRecoveryConfirmed
+}
+
+// ProbeQuotaRecovery distinguishes missing fetch capacity from a completed
+// usage check so the manager can retry deferred work on the next rejection.
+func (e *ClaudeExecutor) ProbeQuotaRecovery(ctx context.Context, auth *cliproxyauth.Auth, models []string) cliproxyauth.QuotaRecoveryVerdict {
 	if e == nil || auth == nil {
-		return false
+		return cliproxyauth.QuotaRecoveryUnconfirmed
 	}
 	accessToken, baseURL := claudeCreds(auth)
-	if !helps.IsClaudeOAuthAccessToken(accessToken) {
-		return false
-	}
-	if strings.TrimSpace(baseURL) != "" && !isAnthropicUpstreamBase(baseURL) {
-		return false
+	if !helps.IsClaudeOAuthAccessToken(accessToken) || (strings.TrimSpace(baseURL) != "" && !isAnthropicUpstreamBase(baseURL)) {
+		return cliproxyauth.QuotaRecoveryUnconfirmed
 	}
 	userAgent := helps.ResolveClaudeDeviceProfile(auth, accessToken, nil, e.cfg).UserAgent
 	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
@@ -447,11 +452,15 @@ func (e *ClaudeExecutor) QuotaRecovered(ctx context.Context, auth *cliproxyauth.
 		models = []string{""}
 	}
 	for _, model := range models {
-		if e.oauthUsageVerifier.Verdict(ctx, client, accessToken, userAgent, model) != helps.ClaudeUsageAvailable {
-			return false
+		switch e.oauthUsageVerifier.Verdict(ctx, client, accessToken, userAgent, model) {
+		case helps.ClaudeUsageAvailable:
+		case helps.ClaudeUsageNotChecked:
+			return cliproxyauth.QuotaRecoveryDeferred
+		default:
+			return cliproxyauth.QuotaRecoveryUnconfirmed
 		}
 	}
-	return true
+	return cliproxyauth.QuotaRecoveryConfirmed
 }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }

@@ -32,6 +32,9 @@ const (
 	// ClaudeUsageModelExhausted means only a window specific to this model or
 	// its family is used up; other models on the account still have room.
 	ClaudeUsageModelExhausted
+	// ClaudeUsageNotChecked means no result is ready (capacity, cancellation,
+	// or a nonblocking observation still in flight). It is not a failed lookup.
+	ClaudeUsageNotChecked
 )
 
 func (v ClaudeUsageVerdict) String() string {
@@ -42,6 +45,8 @@ func (v ClaudeUsageVerdict) String() string {
 		return "exhausted"
 	case ClaudeUsageModelExhausted:
 		return "model_exhausted"
+	case ClaudeUsageNotChecked:
+		return "not_checked"
 	default:
 		return "unknown"
 	}
@@ -108,16 +113,48 @@ func IsClaudeOAuthAccessToken(token string) bool {
 	return strings.HasPrefix(strings.TrimSpace(token), "sk-ant-oat")
 }
 
-// Verdict compares model against the account's live usage.
+// Verdict compares model against the account's live usage, waiting for a
+// shared lookup if needed. NotChecked does not establish a negative cache hit.
 func (v *ClaudeUsageVerifier) Verdict(ctx context.Context, client *http.Client, accessToken, userAgent, model string) ClaudeUsageVerdict {
-	if v == nil || client == nil || ctx.Err() != nil || !IsClaudeOAuthAccessToken(accessToken) {
+	return v.verdict(ctx, client, accessToken, userAgent, model, false)
+}
+
+// Observe returns cached usage immediately, or starts one bounded background
+// lookup without delaying overload failover. Diagnostic work uses at most one
+// slot, reserving the remaining capacity for decisions that depend on usage.
+func (v *ClaudeUsageVerifier) Observe(ctx context.Context, client *http.Client, accessToken, userAgent, model string) ClaudeUsageVerdict {
+	return v.verdict(ctx, client, accessToken, userAgent, model, true)
+}
+
+func (v *ClaudeUsageVerifier) verdict(ctx context.Context, client *http.Client, accessToken, userAgent, model string, observe bool) ClaudeUsageVerdict {
+	if v == nil || client == nil || !IsClaudeOAuthAccessToken(accessToken) {
 		return ClaudeUsageUnknown
 	}
-	body := v.snapshot(ctx, client, accessToken, userAgent)
-	if body == nil {
-		return ClaudeUsageUnknown
+	if ctx.Err() != nil {
+		return ClaudeUsageNotChecked
 	}
-	return ClaudeUsageVerdictFromBody(body, model)
+	observation := ""
+	if observe {
+		observation = model
+	}
+	entry := v.startSnapshot(ctx, client, accessToken, userAgent, observation, observe)
+	if entry == nil {
+		return ClaudeUsageNotChecked
+	}
+	if observe {
+		select {
+		case <-entry.ready:
+			return ClaudeUsageVerdictFromBody(entry.body, model)
+		default:
+			return ClaudeUsageNotChecked
+		}
+	}
+	select {
+	case <-entry.ready:
+		return ClaudeUsageVerdictFromBody(entry.body, model)
+	case <-ctx.Done():
+		return ClaudeUsageNotChecked
+	}
 }
 
 // ContradictionRetryAfter records that Anthropic rejected authID/model while
@@ -155,25 +192,19 @@ func (v *ClaudeUsageVerifier) ContradictionRetryAfter(authID, model string) time
 	return claudeContradictionBackoff[step]
 }
 
-func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client, accessToken, userAgent string) []byte {
+func (v *ClaudeUsageVerifier) startSnapshot(ctx context.Context, client *http.Client, accessToken, userAgent, observation string, observe bool) *claudeUsageCheck {
 	key := sha256.Sum256([]byte(accessToken))
 	now := v.now()
 	v.mu.Lock()
+	defer v.mu.Unlock()
 	if entry := v.checks[key]; entry != nil {
 		select {
 		case <-entry.ready:
 			if now.Before(entry.expires) {
-				v.mu.Unlock()
-				return entry.body
+				return entry
 			}
 		default:
-			v.mu.Unlock()
-			select {
-			case <-entry.ready:
-				return entry.body
-			case <-ctx.Done():
-				return nil
-			}
+			return entry
 		}
 	}
 	if v.checks == nil {
@@ -190,20 +221,21 @@ func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client,
 			active++
 		}
 	}
-	if active >= claudeUsageMaxConcurrent || len(v.checks) >= claudeUsageMaxEntries {
-		v.mu.Unlock()
+	limit := claudeUsageMaxConcurrent
+	if observe {
+		limit = 1
+	}
+	if active >= limit || len(v.checks) >= claudeUsageMaxEntries {
 		return nil
 	}
 	entry := &claudeUsageCheck{ready: make(chan struct{})}
 	v.checks[key] = entry
-	v.mu.Unlock()
-
 	fetch := v.Fetch
 	if fetch == nil {
 		fetch = fetchClaudeUsage
 	}
-	// The lookup must not inherit one request's cancellation: other callers may
-	// be waiting on it. Its own timeout bounds it instead.
+	// Individual request cancellation cannot cancel shared work. The lookup's
+	// own deadline bounds it; Observe never creates a goroutine for a waiter.
 	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeUsageFetchTimeout)
 	go func() {
 		defer cancel()
@@ -213,13 +245,11 @@ func (v *ClaudeUsageVerifier) snapshot(ctx context.Context, client *http.Client,
 		entry.expires = v.now().Add(claudeUsageCacheTTL)
 		close(entry.ready)
 		v.mu.Unlock()
+		if observe {
+			LogWithRequestID(fetchCtx).WithFields(log.Fields{"model": observation, "reason": "usage=" + ClaudeUsageVerdictFromBody(body, observation).String()}).Info("Claude overload usage check completed")
+		}
 	}()
-	select {
-	case <-entry.ready:
-		return entry.body
-	case <-ctx.Done():
-		return nil
-	}
+	return entry
 }
 
 func fetchClaudeUsage(ctx context.Context, client *http.Client, accessToken, userAgent string) []byte {

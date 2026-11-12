@@ -436,3 +436,87 @@ func TestQuotaRecoveryNeverClearsReplacementCredential(t *testing.T) {
 		})
 	}
 }
+
+func TestQuotaRecoveryPreservesShortOrdinaryRateLimits(t *testing.T) {
+	for _, kind := range []string{"only short", "long sibling", "hidden short", "short credential"} {
+		t.Run(kind, func(t *testing.T) {
+			e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+			m, a := newQuotaRecoveryManager(t, e)
+			markClaudeQuota(m, a.ID, "claude-opus-5-5", 2*time.Minute, kind == "short credential")
+			if kind == "long sibling" || kind == "hidden short" {
+				markClaudeQuota(m, a.ID, "claude-fable-5-2", time.Hour, kind == "hidden short")
+			}
+			before, _ := m.GetByID(a.ID)
+			_, _, err := m.pickNext(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, nil)
+			if err == nil || e.checks.Load() != 0 {
+				t.Fatalf("err=%v checks=%d: short rate limit must stay blocked", err, e.checks.Load())
+			}
+			after, _ := m.GetByID(a.ID)
+			if after.Generation != before.Generation {
+				t.Fatal("short rate-limit state was mutated")
+			}
+		})
+	}
+}
+
+func TestQuotaRecoveryPreservesRestrictionsOmittedFromPublicSnapshot(t *testing.T) {
+	e := &quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}, recovered: true}
+	m, a := newQuotaRecoveryManager(t, e)
+	markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, false)
+	before, _ := m.GetByID(a.ID)
+	for _, kind := range []string{"auth transient", "auth indefinite", "model indefinite", "model disabled"} {
+		t.Run(kind, func(t *testing.T) {
+			snapshot := before.Clone()
+			switch kind {
+			case "auth transient", "auth indefinite":
+				snapshot.Unavailable = true
+				snapshot.Quota = QuotaState{}
+				snapshot.LastError = &Error{HTTPStatus: 529}
+				snapshot.NextRetryAfter = time.Now().Add(2 * time.Hour)
+				if kind == "auth indefinite" {
+					snapshot.NextRetryAfter = time.Time{}
+				}
+			default:
+				snapshot.ModelStates["claude-fable-5-2"] = &ModelState{Unavailable: true, Status: StatusError, LastError: &Error{HTTPStatus: 529}}
+				if kind == "model disabled" {
+					snapshot.ModelStates["claude-fable-5-2"].Status = StatusDisabled
+				}
+			}
+			if _, ok := longQuotaCooldownModels(snapshot, time.Now()); ok {
+				t.Fatal("restriction omitted from the public snapshot would be erased")
+			}
+		})
+	}
+}
+
+type quotaProbingExecutor struct {
+	quotaRecoveryExecutor
+	verdict QuotaRecoveryVerdict
+}
+
+func (e *quotaProbingExecutor) ProbeQuotaRecovery(context.Context, *Auth, []string) QuotaRecoveryVerdict {
+	e.checks.Add(1)
+	return e.verdict
+}
+
+func TestQuotaRecoveryDoesNotThrottleSkippedChecks(t *testing.T) {
+	for _, first := range []QuotaRecoveryVerdict{QuotaRecoveryDeferred, QuotaRecoveryUnconfirmed} {
+		t.Run(fmt.Sprint(first), func(t *testing.T) {
+			e := &quotaProbingExecutor{quotaRecoveryExecutor: quotaRecoveryExecutor{successExecutor: successExecutor{provider: "claude"}}, verdict: first}
+			m, a := newQuotaRecoveryManager(t, e)
+			markClaudeQuota(m, a.ID, "claude-opus-5-5", time.Hour, true)
+			if reset := m.RecoverQuotaCooldowns(context.Background()); len(reset) != 0 {
+				t.Fatal("unconfirmed check lifted quota")
+			}
+			e.verdict = QuotaRecoveryConfirmed
+			reset := m.RecoverQuotaCooldowns(context.Background())
+			if first == QuotaRecoveryDeferred {
+				if len(reset) != 1 || e.checks.Load() != 2 {
+					t.Fatalf("deferred check throttled: reset=%v checks=%d", reset, e.checks.Load())
+				}
+			} else if len(reset) != 0 || e.checks.Load() != 1 {
+				t.Fatal("completed negative check was not throttled")
+			}
+		})
+	}
+}

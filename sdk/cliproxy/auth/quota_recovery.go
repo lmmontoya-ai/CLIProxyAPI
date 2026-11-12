@@ -18,13 +18,28 @@ type QuotaRecoveryChecker interface {
 	QuotaRecovered(ctx context.Context, auth *Auth, models []string) bool
 }
 
+// QuotaRecoveryVerdict distinguishes a completed check from admission failure.
+type QuotaRecoveryVerdict int
+
+const (
+	QuotaRecoveryUnconfirmed QuotaRecoveryVerdict = iota
+	QuotaRecoveryConfirmed
+	QuotaRecoveryDeferred
+)
+
+// QuotaRecoveryProber optionally reports that no check could run. A deferred
+// check must not throttle recovery as though it had observed exhausted usage.
+type QuotaRecoveryProber interface {
+	ProbeQuotaRecovery(ctx context.Context, auth *Auth, models []string) QuotaRecoveryVerdict
+}
+
 const (
 	quotaRecoveryInterval      = time.Minute
 	quotaRecoveryTimeout       = 3 * time.Second
 	quotaRecoveryMaxConcurrent = 3
 	quotaRecoveryMaxEntries    = 256
 	// Leave short retry windows and transient overload/rate backoffs alone.
-	quotaRecoveryMinRemaining = 30 * time.Second
+	quotaRecoveryMinRemaining = 5 * time.Minute
 )
 
 type quotaRecoveryCall struct {
@@ -190,7 +205,13 @@ func (m *Manager) startQuotaRecovery(ctx context.Context, auth *Auth, models []s
 		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quotaRecoveryTimeout)
 		defer cancel()
 		recovered := false
-		if checker.QuotaRecovered(checkCtx, auth, models) && checkCtx.Err() == nil {
+		verdict := QuotaRecoveryUnconfirmed
+		if prober, ok := checker.(QuotaRecoveryProber); ok {
+			verdict = prober.ProbeQuotaRecovery(checkCtx, auth, models)
+		} else if checker.QuotaRecovered(checkCtx, auth, models) {
+			verdict = QuotaRecoveryConfirmed
+		}
+		if verdict == QuotaRecoveryConfirmed && checkCtx.Err() == nil {
 			updated, _, errReset := m.resetQuota(checkCtx, auth.ID, auth)
 			if errReset != nil {
 				log.Warnf("quota recovery failed: auth=%s error=%v", auth.ID, errReset)
@@ -202,6 +223,9 @@ func (m *Manager) startQuotaRecovery(ctx context.Context, auth *Auth, models []s
 		state.mu.Lock()
 		call.recovered = recovered
 		call.expires = time.Now().Add(quotaRecoveryInterval)
+		if verdict == QuotaRecoveryDeferred {
+			call.expires = time.Time{}
+		}
 		state.active--
 		close(call.ready)
 		state.mu.Unlock()
@@ -210,50 +234,46 @@ func (m *Manager) startQuotaRecovery(ctx context.Context, auth *Auth, models []s
 }
 
 // A whole-credential reset requires confirmed room for every blocked model.
-// Never erase transient rate/overload backoff, authentication or other errors.
+// Subscription usage cannot disprove short-term rates or non-quota restrictions,
+// including independent layers hidden beneath credential-wide quota state.
 func longQuotaCooldownModels(auth *Auth, now time.Time) (models []string, ok bool) {
-	if auth == nil {
+	if auth == nil || !quotaRecoveryAllowsState(auth.Unavailable, auth.Quota, auth.NextRetryAfter, auth.StatusMessage, auth.LastError, now) {
 		return nil, false
 	}
-	// The public snapshot only shows the effective outer quota deadline. A
-	// shorter independent restriction can still be live underneath that layer,
-	// and a whole-credential reset would erase it too.
 	for _, state := range auth.ModelStates {
 		if state == nil {
 			continue
 		}
-		if state.Status == StatusDisabled {
+		if state.Status == StatusDisabled || !quotaRecoveryAllowsState(state.Unavailable, state.Quota, state.NextRetryAfter, state.StatusMessage, state.LastError, now) {
 			return nil, false
 		}
-		shadow := state.credentialQuotaShadow
-		if shadow == nil {
-			continue
-		}
-		if shadow.Status == StatusDisabled {
-			return nil, false
-		}
-		blocked, _, next := availabilityBlock(shadow.Unavailable, shadow.Quota.Exceeded, shadow.NextRetryAfter, shadow.Quota.NextRecoverAt, now)
-		if !blocked {
-			continue
-		}
-		view := newCooldownView("model", "", next, now, shadow.Quota, shadow.StatusMessage, shadow.LastError)
-		if view.Reason != "quota" && view.Reason != "credential_quota" {
-			return nil, false
+		if shadow := state.credentialQuotaShadow; shadow != nil {
+			if shadow.Status == StatusDisabled || !quotaRecoveryAllowsState(shadow.Unavailable, shadow.Quota, shadow.NextRetryAfter, shadow.StatusMessage, shadow.LastError, now) {
+				return nil, false
+			}
 		}
 	}
-	long := false
-	for _, view := range CooldownSnapshotForAuth(auth, now) {
-		switch view.Reason {
-		case "quota", "credential_quota":
-			if view.RetryAt.Sub(now) > quotaRecoveryMinRemaining {
-				long = true
-			}
-			if view.ModelKey != "" {
-				models = append(models, view.ModelKey)
-			}
-		default:
+	views := CooldownSnapshotForAuth(auth, now)
+	for _, view := range views {
+		if (view.Reason != "quota" && view.Reason != "credential_quota") || view.RetryAt.Sub(now) <= quotaRecoveryMinRemaining {
 			return nil, false
 		}
+		if view.ModelKey != "" {
+			models = append(models, view.ModelKey)
+		}
 	}
-	return models, long
+	return models, len(views) > 0
+}
+
+func quotaRecoveryAllowsState(unavailable bool, quota QuotaState, nextRetry time.Time, message string, lastError *Error, now time.Time) bool {
+	blocked, _, next := availabilityBlock(unavailable, quota.Exceeded, nextRetry, quota.NextRecoverAt, now)
+	if !blocked {
+		return true
+	}
+	// A missing deadline is a restriction too, never evidence of recovery.
+	if next.Sub(now) <= quotaRecoveryMinRemaining {
+		return false
+	}
+	view := newCooldownView("", "", next, now, quota, message, lastError)
+	return view.Reason == "quota" || view.Reason == "credential_quota"
 }

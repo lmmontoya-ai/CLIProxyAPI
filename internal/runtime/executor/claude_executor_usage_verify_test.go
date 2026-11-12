@@ -3,8 +3,10 @@ package executor
 import (
 	"context"
 	"errors"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,6 +218,7 @@ func TestClaudeClassifyOverloadChecksUsageWithoutErasingOverload(t *testing.T) {
 						t.Fatalf("overload altered: %T %v scope=%v transient=%v retry=%v", err, err, cs, tr, retry)
 					}
 				}
+				e.oauthUsageVerifier.Verdict(context.Background(), http.DefaultClient, "sk-ant-oat01-test", "", "claude-opus-5-5")
 				if calls.Load() != 1 {
 					t.Fatalf("usage calls=%d, want cached single lookup", calls.Load())
 				}
@@ -223,3 +226,76 @@ func TestClaudeClassifyOverloadChecksUsageWithoutErasingOverload(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeClassifyOverloadDoesNotWaitForUsage(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	e := NewClaudeExecutor(nil)
+	e.oauthUsageVerifier.Fetch = func(context.Context, *http.Client, string, string) []byte {
+		close(started)
+		<-release
+		return []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`)
+	}
+	response := weeklyRejection429()
+	response.StatusCode = 529
+	response.Header.Set("Retry-After", "15")
+	req := claudeUsageTestRequest(t)
+	result := make(chan error, 1)
+	go func() {
+		result <- e.classifyUpstreamError(context.Background(), claudeUsageTestAuth("sk-ant-oat01-test"), req, response, []byte(`{"error":{"type":"overloaded_error"}}`), "claude-opus-5-5", false)
+	}()
+	<-started
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if _, _, retry := errorScope(t, err); retry == nil || *retry != 15*time.Second {
+			close(release)
+			t.Fatal("overload retry changed")
+		}
+	case <-timer.C:
+		close(release)
+		t.Fatal("529 failover waited for usage fetch")
+	}
+	close(release)
+	if got := e.oauthUsageVerifier.Verdict(context.Background(), http.DefaultClient, "sk-ant-oat01-test", "", "claude-opus-5-5"); got != helps.ClaudeUsageAvailable {
+		t.Fatalf("background usage=%s", got)
+	}
+}
+
+func TestClaudeUsageProbeDefersWhenLookupSlotsAreFull(t *testing.T) {
+	started, release := make(chan struct{}, 4), make(chan struct{})
+	e := NewClaudeExecutor(nil)
+	var calls atomic.Int32
+	e.oauthUsageVerifier.Fetch = func(context.Context, *http.Client, string, string) []byte {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`)
+	}
+	var wg sync.WaitGroup
+	for _, token := range []string{"sk-ant-oat01-a", "sk-ant-oat01-b", "sk-ant-oat01-c"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.oauthUsageVerifier.Verdict(context.Background(), http.DefaultClient, token, "", "claude-opus-5-5")
+		}()
+	}
+	<-started
+	<-started
+	<-started
+	auth := claudeUsageTestAuth("sk-ant-oat01-deferred")
+	got := e.ProbeQuotaRecovery(context.Background(), auth, []string{"claude-opus-5-5"})
+	close(release)
+	wg.Wait()
+	if got != cliproxyauth.QuotaRecoveryDeferred {
+		t.Fatalf("saturated probe=%v, want deferred", got)
+	}
+	if got = e.ProbeQuotaRecovery(context.Background(), auth, []string{"claude-opus-5-5"}); got != cliproxyauth.QuotaRecoveryConfirmed {
+		t.Fatalf("subsequent probe=%v, want confirmed", got)
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("calls=%d, want no cached failure for skipped check", calls.Load())
+	}
+}
+
+var _ cliproxyauth.QuotaRecoveryProber = (*ClaudeExecutor)(nil)

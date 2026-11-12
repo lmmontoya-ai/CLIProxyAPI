@@ -257,7 +257,7 @@ func TestClaudeUsageVerifierCanceledLeaderDoesNotCancelSharedLookup(t *testing.T
 	go func() { result <- v.Verdict(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5") }()
 	<-started
 	cancel()
-	if got := <-result; got != ClaudeUsageUnknown {
+	if got := <-result; got != ClaudeUsageNotChecked {
 		t.Fatalf("canceled caller got %s", got)
 	}
 	close(release)
@@ -284,7 +284,7 @@ func TestClaudeUsageVerifierBoundsConcurrentAccounts(t *testing.T) {
 	for i := 0; i < claudeUsageMaxConcurrent; i++ {
 		<-started
 	}
-	if got := v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken+"extra", "", "claude-opus-5-5"); got != ClaudeUsageUnknown {
+	if got := v.Verdict(context.Background(), http.DefaultClient, testClaudeOAuthToken+"extra", "", "claude-opus-5-5"); got != ClaudeUsageNotChecked {
 		t.Fatalf("capacity overflow got %s", got)
 	}
 	close(release)
@@ -305,5 +305,61 @@ func TestClaudeUsageVerdictRejectsMalformedKnownWindows(t *testing.T) {
 				t.Fatalf("verdict=%s, want unknown for malformed window", got)
 			}
 		})
+	}
+}
+
+func TestClaudeUsageObserveIsNonblockingAndReservesDecisionCapacity(t *testing.T) {
+	started, release := make(chan struct{}, 3), make(chan struct{})
+	var calls atomic.Int32
+	v := &ClaudeUsageVerifier{Fetch: func(context.Context, *http.Client, string, string) []byte {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return []byte(`{"five_hour":null,"seven_day":{"utilization":10}}`)
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan ClaudeUsageVerdict, 1)
+	go func() { done <- v.Observe(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5") }()
+	<-started
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case got := <-done:
+		if got != ClaudeUsageNotChecked {
+			t.Fatalf("pending observation=%s", got)
+		}
+	case <-timer.C:
+		close(release)
+		t.Fatal("observation waited for usage instead of returning immediately")
+	}
+	for i := 0; i < 10; i++ {
+		v.Observe(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5")
+		v.Observe(ctx, http.DefaultClient, testClaudeOAuthToken+"another", "", "claude-opus-5-5")
+	}
+	if calls.Load() != 1 {
+		close(release)
+		t.Fatal("diagnostic traffic occupied decision slots")
+	}
+	var wg sync.WaitGroup
+	for _, suffix := range []string{"decision-a", "decision-b"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v.Verdict(ctx, http.DefaultClient, testClaudeOAuthToken+suffix, "", "claude-opus-5-5")
+		}()
+	}
+	<-started
+	<-started
+	close(release)
+	wg.Wait()
+	if got := v.Verdict(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5"); got != ClaudeUsageAvailable {
+		t.Fatalf("warmed usage=%s", got)
+	}
+	if got := v.Observe(ctx, http.DefaultClient, testClaudeOAuthToken, "", "claude-opus-5-5"); got != ClaudeUsageAvailable {
+		t.Fatalf("cached observation=%s", got)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("fetches=%d, want 1 diagnostic plus 2 decisions", calls.Load())
 	}
 }
